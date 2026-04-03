@@ -142,7 +142,7 @@ def main():
     search_parser.set_defaults(func=search.search)
 
     args = parser.parse_args()
-    if os.path.exists(args.chip_dir):
+    if args.command == "chip" and os.path.exists(args.chip_dir):
         warnings.warn("Chip directory exists")
         print(
             "Remove it if you would like a fresh directory."
