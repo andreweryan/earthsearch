@@ -16,6 +16,7 @@ warnings.filterwarnings("ignore")
 
 gc.enable()
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 class Results(TypedDict):
     path: str
@@ -156,19 +157,25 @@ class FeatureExtractor:
         Returns:
             features (np.ndarray): Image embedding as a numpy array
         """
+        
         if isinstance(src, str):
-            image = Image.open(src)
+            image = Image.open(src).convert("RGB")
         elif isinstance(src, np.ndarray):
-            image = Image.fromarray(src)
+            image = Image.fromarray(src).convert("RGB")
         else:
-            image = src
-
+            image = src.convert("RGB")
         image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+        
 
         with torch.no_grad():
-            feature = self.model(image_tensor)
+            feats = self.model.forward_features(image_tensor)
 
-        return feature.squeeze().flatten().cpu().numpy()
+        patch_tokens = feats["x_norm_patchtokens"]
+        embedding = patch_tokens.mean(dim=1)
+        embedding = embedding.squeeze().cpu().numpy()
+        embedding /= np.linalg.norm(embedding)
+
+        return embedding
 
 
 class VectorDatabase:
@@ -368,7 +375,8 @@ class ImageSimilaritySearch:
 def show_search_results(
     src: Union[str, np.ndarray],
     results: List[dict],
-    max_display: int = 3,
+    max_display: int = 10,
+    cols: int = 5,
 ):
     """
     Display search results
@@ -377,6 +385,7 @@ def show_search_results(
         src: Path to query image or np.ndarray
         results (List[dict]): Results list containing dicts of nearest neighbor results
         max_display (int): Max number of results to display, typically just top_k
+        cols (int): Number of columns in the results grid
 
     Return:
         None
@@ -387,20 +396,78 @@ def show_search_results(
         query_image = src
 
     num_results = min(max_display, len(results))
+    cols = max(1, min(cols, num_results)) if num_results > 0 else 1
+    result_rows = int(np.ceil(num_results / cols)) if num_results > 0 else 0
 
-    fig, axes = plt.subplots(1, num_results + 1, figsize=(4 * (num_results + 1), 4))
+    text_color = "#1a1a1a"
+    muted_color = "#6b6b6b"
+    border_color = "#d8d8d8"
+    bg_color = "#fafafa"
 
-    # Display query image
-    axes[0].imshow(query_image)
-    axes[0].set_title("Query Image")
-    axes[0].axis("off")
+    fig_w = min(2.2 * cols, 13.5)
+    fig_h = min(2.0 * result_rows + 3.0, 8.5)
+    fig = plt.figure(
+        figsize=(fig_w, fig_h),
+        dpi=90,
+        constrained_layout=True,
+        facecolor=bg_color,
+    )
+    gs = fig.add_gridspec(
+        result_rows + 1,
+        cols,
+        height_ratios=[1.5] + [1.0] * result_rows if result_rows else [1.0],
+    )
 
-    # Display results
+    def _style_panel(ax, lw=0.8):
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_facecolor(bg_color)
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_edgecolor(border_color)
+            spine.set_linewidth(lw)
+
+    ax_query = fig.add_subplot(gs[0, :])
+    ax_query.imshow(query_image)
+    ax_query.set_title(
+        "QUERY",
+        fontsize=10,
+        fontweight="bold",
+        color=muted_color,
+        loc="left",
+        pad=10,
+    )
+    _style_panel(ax_query, lw=1.2)
+
     for i in range(num_results):
-        result_path, distance = results[i]["path"], results[i]["distance"]
+        r, c = divmod(i, cols)
+        ax = fig.add_subplot(gs[r + 1, c])
+        result_path = results[i]["path"]
+        distance = results[i]["distance"]
         result_image = Image.open(result_path)
-        axes[i + 1].imshow(result_image)
-        axes[i + 1].set_title(f"Distance: {int(distance)}")
-        axes[i + 1].axis("off")
+        ax.imshow(result_image)
+        ax.set_title(
+            f"#{i + 1:02d}",
+            fontsize=11,
+            fontweight="bold",
+            color=text_color,
+            loc="left",
+            pad=6,
+        )
+        ax.set_xlabel(
+            f"distance  {distance:.3f}",
+            fontsize=9,
+            color=muted_color,
+            labelpad=6,
+        )
+        _style_panel(ax)
 
+    fig.suptitle(
+        "Similarity Search Results",
+        fontsize=18,
+        fontweight="600",
+        color=text_color,
+        x=0.02,
+        ha="left",
+    )
     plt.show()

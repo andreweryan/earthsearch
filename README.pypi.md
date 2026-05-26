@@ -73,7 +73,7 @@ model_type = "dinov2_vits14_reg"
 device = "cuda" # or "mps", "cpu
 batch_size = 32
 
-query_image = "path/to/query/for/top_k/similar/images", 
+query_image = "path/to/query/for/top_k/similar/images"
 top_k = 10
 
 chip(image_dir, chip_dir, window_size, stride, valid_exts, multiprocess=True)

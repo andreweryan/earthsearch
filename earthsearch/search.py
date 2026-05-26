@@ -54,7 +54,7 @@ def search(
         )
         return None
 
-    if "_reg" in model_type and torch.mps.is_available():
+    if "_reg" in model_type and torch.backends.mps.is_available():
         print(
             "Some PyTorch functionality using DINOv2 models with Registers "
             "not supported by MPS yet, reverting to CPU"
@@ -67,7 +67,7 @@ def search(
             else (
                 "cuda"
                 if torch.cuda.is_available()
-                else "mps" if torch.mps.is_available() else "cpu"
+                else "mps" if torch.backends.mps.is_available() else "cpu"
             )
         )
 

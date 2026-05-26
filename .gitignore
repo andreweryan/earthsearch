@@ -26,3 +26,7 @@ MANIFEST
 */.DS_Store
 package.sh
 README.pypi.md
+idx.faiss
+paths.txt
+test.py
+examples/
