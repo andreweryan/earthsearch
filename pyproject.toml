@@ -30,7 +30,7 @@ dependencies = [
     "faiss-cpu",
     "matplotlib",
     "torchvision",
-    "gdal==3.10.1",
+    "gdal",
     "opencv-python",
     "albumentations"
     ]
