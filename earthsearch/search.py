@@ -31,6 +31,7 @@ def search(
         "dinov2_vitg14_reg",
     ] = "dinov2_vits14_reg",
     device: Literal["cuda", "mps", "cpu"] = "cuda",
+    tta: bool = True,
 ) -> List[Results]:
     """
 
@@ -77,8 +78,8 @@ def search(
     searcher.load(
         index_path, indexed_images_path
     )  # Load the previously saved index and image paths file
-    results = searcher.find_similar(query_image, top_k=top_k)  # Run sample search
-    print(f"Querying top {top_k} similar images to: {query_image}")
+    results = searcher.find_similar(query_image, top_k=top_k, tta=tta)
+    print(f"Querying top {top_k} similar images to: {query_image} (TTA={'on' if tta else 'off'})")
     print("Matches:")
     for idx, result in enumerate(results):
         print(f"{idx + 1}: {result["path"]} - Distance: {result["distance"]}")

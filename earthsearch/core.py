@@ -41,6 +41,7 @@ class FeatureExtractor:
             "dinov2_vitg14",
         ] = "dinov2_vits14_reg",
         device: Literal["cuda", "mps", "cpu"] = "cuda",
+        input_size: int = 518,
     ) -> None:
         """
         Initialize the feature extractor.
@@ -49,7 +50,10 @@ class FeatureExtractor:
             model_type: Type of model to use ("resnet18", "resnet34", "resnet50", "resnet101", "resnet152",
                 "dinov2_vits14", "dinov2_vits14_reg, "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14")
             device: Device to use for inference ("cuda": NVIDIA GPU, "mps": Apple M-series chips, "cpu").
+            input_size: Square input edge in pixels. Must be a multiple of the model's
+                patch size (14 for DINOv2). Larger preserves more spatial detail.
         """
+        self.input_size = input_size
         self.device = (
             device
             if device
@@ -135,11 +139,20 @@ class FeatureExtractor:
         self.model = self.model.to(self.device)
         self.model.eval()
 
-        # ImageNet Transforms
+        # Concat of CLS + patch-mean for DINOv2 → output dim doubles
+        if model_type.startswith("dinov2"):
+            self.embedding_dim *= 2
+
+        if model_type.startswith("dinov2") and self.input_size % 14 != 0:
+            raise ValueError(
+                f"input_size={self.input_size} must be a multiple of 14 for DINOv2"
+            )
+
+        # Preserve full chip content: resize to input_size, no CenterCrop.
+        # DINOv2 was pretrained with ImageNet stats — those should be used at inference.
         self.transform = transforms.Compose(
             [
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
+                transforms.Resize((self.input_size, self.input_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -147,35 +160,71 @@ class FeatureExtractor:
             ]
         )
 
-    def extract_embedding(self, src: Union[str, np.ndarray, PIL.Image]) -> np.array:
-        """
-        Extract embedding from an image.
-
-        Args:
-            src (Union[str, np.ndarray, PIL.Image]): Source image as a file path, numpy array or PIL Image
-
-        Returns:
-            features (np.ndarray): Image embedding as a numpy array
-        """
-        
+    def _to_pil(self, src: Union[str, np.ndarray, PIL.Image.Image]) -> Image.Image:
         if isinstance(src, str):
-            image = Image.open(src).convert("RGB")
-        elif isinstance(src, np.ndarray):
-            image = Image.fromarray(src).convert("RGB")
-        else:
-            image = src.convert("RGB")
-        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-        
+            return Image.open(src).convert("RGB")
+        if isinstance(src, np.ndarray):
+            return Image.fromarray(src).convert("RGB")
+        return src.convert("RGB")
 
+    def _embed_pil(self, image: Image.Image) -> np.ndarray:
+        """Run a single PIL image through the model, return a unit-normalized vector."""
+        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
         with torch.no_grad():
             feats = self.model.forward_features(image_tensor)
-
-        patch_tokens = feats["x_norm_patchtokens"]
-        embedding = patch_tokens.mean(dim=1)
+        cls = feats["x_norm_clstoken"]
+        patch_mean = feats["x_norm_patchtokens"].mean(dim=1)
+        embedding = torch.cat([cls, patch_mean], dim=-1)
         embedding = embedding.squeeze().cpu().numpy()
         embedding /= np.linalg.norm(embedding)
-
         return embedding
+
+    def extract_embedding(self, src: Union[str, np.ndarray, PIL.Image.Image]) -> np.ndarray:
+        """
+        Extract a unit-normalized embedding (CLS + patch-mean concatenated).
+
+        Args:
+            src: Source image as a file path, numpy array, or PIL Image.
+
+        Returns:
+            features (np.ndarray): 1D embedding of length `self.embedding_dim`.
+        """
+        return self._embed_pil(self._to_pil(src))
+
+    def extract_query_embedding(
+        self,
+        src: Union[str, np.ndarray, PIL.Image.Image],
+        rotations: Tuple[int, ...] = (0, 90, 180, 270),
+    ) -> np.ndarray:
+        """
+        Query-time embedding with rotation test-time augmentation.
+
+        Satellite imagery has no canonical orientation; averaging embeddings over
+        90° rotations of the query makes retrieval invariant to viewing angle.
+
+        Args:
+            src: Source image as a file path, numpy array, or PIL Image.
+            rotations: Multiples of 90° to embed. Default covers all 4 orientations.
+
+        Returns:
+            features (np.ndarray): Averaged, unit-normalized embedding.
+        """
+        rotate_map = {
+            0: None,
+            90: Image.Transpose.ROTATE_90,
+            180: Image.Transpose.ROTATE_180,
+            270: Image.Transpose.ROTATE_270,
+        }
+        image = self._to_pil(src)
+        embeddings = []
+        for r in rotations:
+            if r not in rotate_map:
+                raise ValueError(f"rotations must be in {{0, 90, 180, 270}}, got {r}")
+            rotated = image if r == 0 else image.transpose(rotate_map[r])
+            embeddings.append(self._embed_pil(rotated))
+        avg = np.mean(embeddings, axis=0)
+        avg /= np.linalg.norm(avg)
+        return avg
 
 
 class VectorDatabase:
@@ -187,10 +236,15 @@ class VectorDatabase:
 
         Args:
             embedding_dim (int): Dimension of the embedding vectors
-            index_type (str): Type of FAISS index to use ("L2")
+            index_type (str): "L2" or "IP". With unit-normalized embeddings,
+                IP gives cosine similarity directly (higher = better), while L2
+                returns sqrt(2 - 2*cos_sim) (lower = better). Rankings match.
         """
+        self.index_type = index_type
         if index_type == "L2":
             self.index = faiss.IndexFlatL2(embedding_dim)
+        elif index_type == "IP":
+            self.index = faiss.IndexFlatIP(embedding_dim)
         else:
             raise ValueError(f"Unsupported index type: {index_type}")
 
@@ -267,8 +321,11 @@ class ImageSimilaritySearch:
             "dinov2_vits14",
             "dinov2_vits14_reg",
             "dinov2_vitb14",
+            "dinov2_vitb14_reg",
             "dinov2_vitl14",
+            "dinov2_vitl14_reg",
             "dinov2_vitg14",
+            "dinov2_vitg14_reg",
         ] = "dinov2_vits14_reg",
         index_type: str = "L2",
         device: Literal["cuda", "mps", "cpu"] = "cuda",
@@ -326,18 +383,26 @@ class ImageSimilaritySearch:
                 # print(f"Indexed {min(i+batch_size, len(image_paths))}/{len(image_paths)} images")
                 progress_bar.update(len(batch_paths))
 
-    def find_similar(self, query_image_path: str, top_k: int = 10) -> List[Results]:
+    def find_similar(
+        self, query_image_path: str, top_k: int = 10, tta: bool = True
+    ) -> List[Results]:
         """
         Find images similar to the query image.
 
         Args:
             query_image_path (str): Path to the query image
             top_k (int): Number of nearest neighbors to return
+            tta (bool): If True, average the query embedding over 4 rotations
+                for orientation invariance. Adds ~4× query cost (one-shot at
+                search time, so usually negligible).
 
         Returns:
             List of dictionaries with similarity results
         """
-        query_embedding = self.extractor.extract_embedding(query_image_path)
+        if tta:
+            query_embedding = self.extractor.extract_query_embedding(query_image_path)
+        else:
+            query_embedding = self.extractor.extract_embedding(query_image_path)
         distances, result_paths = self.db.search(query_embedding, top_k)
 
         results = []
