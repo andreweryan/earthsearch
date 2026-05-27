@@ -32,3 +32,5 @@ idx.faiss
 *paths.txt
 paths.txt
 examples/
+figs/
+store_xview/

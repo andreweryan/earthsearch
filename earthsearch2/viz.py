@@ -5,6 +5,7 @@ source raster and pull the relevant window via SourceReader at display time.
 """
 
 from __future__ import annotations
+import os
 
 from typing import List, Optional, Tuple
 
@@ -21,6 +22,9 @@ def show_results(
     query_image: Optional[str] = None,
     max_display: int = 10,
     cols: int = 5,
+    show: bool = True,
+    save: bool = True,
+    save_dir: str = "results"
 ) -> None:
     """Plot query thumbnail (top) + result grid below, reading windows on demand."""
     n = min(max_display, len(scored_specs))
@@ -101,4 +105,15 @@ def show_results(
         x=0.02,
         ha="left",
     )
-    plt.show()
+    if save:
+        os.makedirs(save_dir, exist_ok=True)
+
+        basename = os.path.basename(query_image).split(".")[0]
+
+        save_path = os.path.join(save_dir, f"{basename}_results.png")
+        plt.savefig(save_path)
+
+    if show:
+        plt.show()
+    
+    plt.close()
