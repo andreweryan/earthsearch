@@ -4,6 +4,7 @@ import numpy as np
 from numba import jit
 from tqdm import tqdm
 from osgeo import gdal
+from pathlib import Path
 from affine import Affine
 from shapely.geometry import box
 from typing import Union, List, Tuple
@@ -75,19 +76,54 @@ def make_windows(
 
     return geoinfo_list
 
+GeoTransform = Tuple[float, float, float, float, float, float]
 
-def pixel2longlat(
-    geotransform: Union[str, List[Union[float, int]]], px: float, py: float
-) -> Tuple[float, float]:
-    """Convert Column, Row pixel coordinates to Longitude, Latitude coordinates.
+
+def to_shapely_matrix(A: Affine) -> Tuple[float, float, float, float, float, float]:
+    """
+    Convert an Affine transform into the parameter format expected by
+    shapely.affinity.affine_transform.
+
+    Shapely expects parameters in the form:
+        [a, b, d, e, xoff, yoff]
 
     Args:
-        geotransform (List): Image GDAL GeoTransform
-        px (float): Column pixel coordinate
-        py (float): Row pixel coordinate
+        A (Affine): Affine transformation matrix.
+    Return:
+        Tuple[float, float, float, float, float, float]:
+            Parameters in Shapely affine format.
+    """
+    return (A.a, A.b, A.d, A.e, A.c, A.f)
+
+
+def normalize_geotransform(geotransform: Union[GeoTransform, str]) -> Affine:
+    """
+    Normalize a GDAL geotransform into an Affine object.
+
+    Args:
+        geotransform (Union[GeoTransform, str]):
+            GDAL geotransform as a tuple or string representation.
 
     Return:
-        Tuple(float, float): Longitude, Latitude coordinates
+        Affine: Affine transformation object.
+    """
+    if isinstance(geotransform, str):
+        geotransform = eval(geotransform)
+    return Affine.from_gdal(*geotransform)
+
+
+def pixel2lonlat(
+    geotransform: Tuple[float, float, float, float, float, float], px: float, py: float
+) -> Tuple[float, float]:
+    """
+    Convert Column, Row pixel coordinates to Longitude, Latitude coordinates.
+
+    Args:
+        geotransform (Tuple[float]): Image geotransform
+        px (float): X pixel coordinate
+        py (float): Y pixel coordinate
+    Return:
+        Tuple[float, float]: X, Y converted to Longitude, Latitude
     """
 
     if isinstance(geotransform, str):
@@ -95,9 +131,33 @@ def pixel2longlat(
     else:
         affine_transform = Affine.from_gdal(*geotransform)
 
-    x, y = affine_transform * (px, py)
+    lon, lat = affine_transform * (px, py)
 
-    return (x, y)
+    return lon, lat
+
+
+def lonlat2pixel(
+    geotransform: Tuple[float, float, float, float, float, float], lon: float, lat: float
+) -> Tuple[int, int]:
+    """
+    Convert Longitude, Latitude geocoordinates to Column, Row pixel coordinates.
+
+    Args:
+        geotransform (Tuple[float]): Image geotransform
+        lon (float): Longitude coordinate
+        lat (float): Latitude coordinate
+    Return:
+        Tuple[int, int]: Longitude, Latitude converted to X, Y pixel coordinates
+    """
+
+    if isinstance(geotransform, str):
+        affine_transform = Affine.from_gdal(*eval(str(geotransform)))
+    else:
+        affine_transform = Affine.from_gdal(*geotransform)
+
+    px, py = ~affine_transform * (lon, lat)
+
+    return int(px), int(py)
 
 
 def chip_image(
@@ -154,7 +214,7 @@ def chip_image(
 
         cent_x, cent_y = array.shape[1] // 2, array.shape[2] // 2
 
-        cent_long, cent_lat = pixel2longlat(window_geotransform, cent_x, cent_y)
+        cent_long, cent_lat = pixel2lonlat(window_geotransform, cent_x, cent_y)
         # print(f"{image_id}_{i}_{j}_{window_size}.png", cent_long, cent_lat)
 
         # chip_path = os.path.join(chip_dir, f"{image_id}_{i}_{j}_{window_size}_{cent_long}_{cent_lat}.png")
@@ -170,14 +230,38 @@ def chip_image(
 
     return None
 
+def source_images(src: Union[str, Path, List[Union[str, Path]]], valid_exts: List[str] = [".tif", ".nitf", ".ntf"]) -> List[Path]:
+    src_list: List[Path] = []
+
+    if isinstance(src, list):
+        for p in src:
+            path = Path(p)
+            if path.is_file() and path.suffix.lower() in valid_exts:
+                src_list.append(path)
+        return src_list
+
+    path = Path(src)
+
+    if path.is_file():
+        if path.suffix.lower() in valid_exts:
+            return [path]
+        return []
+
+    if path.is_dir():
+        return [
+            p for p in path.iterdir() if p.is_file() and p.suffix.lower() in valid_exts
+        ]
+
+    raise ValueError(f"Invalid src: {src}")
 
 def chip(
     image_dir: str,
     chip_dir: str,
     window_size: int = 512,
     stride: float = 0.0,
-    valid_exts: List[str] = ["tif", "nitf", "ntf"],
+    valid_exts: List[str] = [".tif", ".nitf", ".ntf"],
     multiprocess: bool = True,
+    overwrite: bool = False,
 ) -> None:
     """
     Chip a directory of images using sliding window.
@@ -193,19 +277,13 @@ def chip(
     Return:
         None
     """
-    if not os.path.exists(chip_dir):
-        os.makedirs(chip_dir, exist_ok=True)
+    if os.path.exists(chip_dir) and not overwrite:
+        return
+    
+    os.makedirs(chip_dir, exist_ok=True)
 
-    if not valid_exts:
-        valid_exts = ["tif", "nitf", "ntf"]
-        valid_exts += [ext.upper() for ext in valid_exts]
-
-    image_paths = [
-        os.path.join(image_dir, i)
-        for i in os.listdir(image_dir)
-        if os.path.basename(i).split(".")[1] in valid_exts
-    ]
-
+    image_paths = source_images(src=image_dir, valid_exts=valid_exts)
+    
     if multiprocess:
         with tqdm(
             total=len(image_paths), desc="Chipping images", unit="image"
