@@ -16,6 +16,10 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+import warnings 
+
+warnings.filterwarnings( "ignore", message="xFormers is available.*")
+warnings.filterwarnings( "ignore", message="xFormers is not available.*")
 
 ModelName = Literal[
     "dinov2_vits14",
@@ -45,7 +49,7 @@ class FeatureExtractor:
         self,
         model_type: ModelName = "dinov2_vits14_reg",
         device: str = None,
-        input_size: int = 518,
+        input_size: int = 224,
     ) -> None:
         if model_type not in _BACKBONE_BASE_DIM:
             raise ValueError(f"Unsupported model_type: {model_type}")
