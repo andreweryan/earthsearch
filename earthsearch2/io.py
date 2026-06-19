@@ -11,12 +11,12 @@ the same source, which is the common pattern during indexing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 from PIL import Image
 from affine import Affine
-from osgeo import gdal
+from osgeo import gdal, gdalconst
 
 gdal.UseExceptions()
 
@@ -82,7 +82,15 @@ def _to_rgb_uint8(arr: np.ndarray) -> np.ndarray:
 
 
 class SourceReader:
-    """Open a source raster once; read many windows."""
+    """Open a source raster once; read many windows.
+
+    When `target_size` is set, the read is overview-aware: GDAL picks the
+    closest pre-built overview level and downsamples to `target_size` in one
+    call. On a COG-ified source this skips ~16x of native pixels for large
+    windows and is typically the biggest win in indexing throughput. On a
+    plain GeoTIFF with no overviews, GDAL falls back to native + resample
+    (correct, just no speedup).
+    """
 
     def __init__(self, path: str):
         self.path = path
@@ -90,8 +98,24 @@ class SourceReader:
         if self.ds is None:
             raise IOError(f"GDAL could not open {path}")
 
-    def read(self, x: int, y: int, window: int) -> Image.Image:
-        arr = self.ds.ReadAsArray(xoff=int(x), yoff=int(y), xsize=int(window), ysize=int(window))
+    def read(
+        self,
+        x: int,
+        y: int,
+        window: int,
+        target_size: Optional[int] = None,
+        resample_alg: int = gdalconst.GRIORA_Bilinear,
+    ) -> Image.Image:
+        out = int(target_size) if target_size else int(window)
+        arr = self.ds.ReadAsArray(
+            xoff=int(x),
+            yoff=int(y),
+            xsize=int(window),
+            ysize=int(window),
+            buf_xsize=out,
+            buf_ysize=out,
+            resample_alg=resample_alg,
+        )
         if arr is None:
             raise IOError(f"Could not read window ({x},{y},{window}) from {self.path}")
         return Image.fromarray(_to_rgb_uint8(arr))
@@ -106,7 +130,13 @@ class SourceReader:
         self.close()
 
 
-def read_window(path: str, x: int, y: int, window: int) -> Image.Image:
+def read_window(
+    path: str,
+    x: int,
+    y: int,
+    window: int,
+    target_size: Optional[int] = None,
+) -> Image.Image:
     """Convenience: open, read one window, close. Prefer SourceReader for many reads."""
     with SourceReader(path) as r:
-        return r.read(x, y, window)
+        return r.read(x, y, window, target_size=target_size)

@@ -92,12 +92,22 @@ class FeatureExtractor:
         return src.convert("RGB")
 
     def _forward(self, batch: torch.Tensor) -> np.ndarray:
-        """Run the model on a (N, 3, H, W) tensor; return (N, 2D) unit-normalized embeddings."""
+        """Run the model on a (N, 3, H, W) tensor; return (N, 2D) unit-normalized embeddings.
+
+        Uses bfloat16 autocast on CUDA — typically ~2x throughput vs fp32 on Ampere+
+        and frees up enough memory to double the batch size. CPU and MPS stay in fp32.
+        """
+        batch = batch.to(self.device, non_blocking=True)
+        use_amp = self.device == "cuda"
         with torch.no_grad():
-            feats = self.model.forward_features(batch.to(self.device))
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    feats = self.model.forward_features(batch)
+            else:
+                feats = self.model.forward_features(batch)
         cls = feats["x_norm_clstoken"]
         patch_mean = feats["x_norm_patchtokens"].mean(dim=1)
-        out = torch.cat([cls, patch_mean], dim=-1).cpu().numpy()
+        out = torch.cat([cls, patch_mean], dim=-1).float().cpu().numpy()
         out /= np.linalg.norm(out, axis=1, keepdims=True)
         return out.astype(np.float32)
 
@@ -109,6 +119,14 @@ class FeatureExtractor:
         """Embed N images in a single forward pass. Returns (N, embedding_dim) float32."""
         tensors = [self.transform(self._to_pil(img)) for img in images]
         batch = torch.stack(tensors, dim=0)
+        return self._forward(batch)
+
+    def embed_tensor_batch(self, batch: torch.Tensor) -> np.ndarray:
+        """Embed a pre-transformed (N, 3, H, W) tensor batch. Returns (N, embedding_dim) float32.
+
+        Lets DataLoader workers do the PIL→tensor→normalize work in parallel so the
+        embedding loop on the main thread just hands batches to the GPU.
+        """
         return self._forward(batch)
 
     def extract_embedding(self, src: Union[str, np.ndarray, Image.Image]) -> np.ndarray:

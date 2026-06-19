@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 from typing import List, Tuple
 
+import torch
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from .chips import ChipSpec, make_chip_grid
@@ -24,6 +26,32 @@ from .store import FaissStore
 
 
 VALID_EXTS = {".tif", ".tiff", ".jp2", ".vrt"}
+
+
+class _ChipDataset(Dataset):
+    """Reads + transforms one chip per __getitem__ call. Designed to live inside
+    DataLoader workers: each worker process lazily opens its own GDAL handles
+    (GDAL datasets are not fork-safe to share across processes).
+    """
+
+    def __init__(self, specs: List[ChipSpec], target_size: int, transform):
+        self.specs = specs
+        self.target_size = target_size
+        self.transform = transform
+        # Per-worker cache; populated lazily after fork/spawn.
+        self._readers = {}
+
+    def __len__(self) -> int:
+        return len(self.specs)
+
+    def __getitem__(self, idx: int):
+        spec = self.specs[idx]
+        reader = self._readers.get(spec.source)
+        if reader is None:
+            reader = SourceReader(spec.source)
+            self._readers[spec.source] = reader
+        img = reader.read(spec.x, spec.y, spec.window, target_size=self.target_size)
+        return self.transform(img), idx
 
 
 def _iter_source_images(image_dir: str) -> List[str]:
@@ -42,6 +70,7 @@ def index_directory(
     model_type: str = "dinov2_vits14_reg",
     device: str = None,
     batch_size: int = 32,
+    num_workers: int = 4,
     overwrite: bool = False,
 ) -> FaissStore:
     """Walk image_dir, embed multi-scale chips on the fly, persist a FaissStore.
@@ -55,7 +84,11 @@ def index_directory(
             0.5 = 50% overlap (catches boundary objects), 1.0 = no overlap.
         model_type: DINOv2 variant name.
         device: "cuda" | "mps" | "cpu" | None (auto).
-        batch_size: Images per forward pass.
+        batch_size: Images per forward pass. On GPU with bfloat16, push this
+            as high as memory allows (128 on 24GB, 256+ on A100-class).
+        num_workers: DataLoader workers reading and preprocessing chips in
+            parallel. 0 = single-process (slow, useful for debugging).
+            4–8 is a good range; more can hurt on CPU due to contention.
         overwrite: If False and store_path exists, load and return without
             re-indexing.
     """
@@ -70,38 +103,39 @@ def index_directory(
     extractor = FeatureExtractor(model_type=model_type, device=device)
     store = FaissStore(embedding_dim=extractor.embedding_dim)
 
-    total_chips = 0
-    for src in tqdm(image_paths, desc="Sources"):
+    # Build the full spec list upfront. Source-grouped ordering means each
+    # DataLoader worker touches few GDAL handles when shuffle=False.
+    all_specs: List[ChipSpec] = []
+    for src in image_paths:
         try:
             meta = read_image_meta(src)
         except IOError as e:
             print(f"skip {src}: {e}")
             continue
+        all_specs.extend(make_chip_grid(meta, window_sizes, stride_fraction))
 
-        specs = list(make_chip_grid(meta, window_sizes, stride_fraction))
-        if not specs:
-            continue
+    if not all_specs:
+        raise ValueError("No chips generated — check window_sizes vs source image dimensions.")
 
-        with SourceReader(src) as reader:
-            batch_specs: List[ChipSpec] = []
-            batch_imgs = []
-            for spec in specs:
-                try:
-                    img = reader.read(spec.x, spec.y, spec.window)
-                except IOError as e:
-                    print(f"  skip spec at ({spec.x},{spec.y},{spec.window}): {e}")
-                    continue
-                batch_specs.append(spec)
-                batch_imgs.append(img)
-                if len(batch_imgs) >= batch_size:
-                    embs = extractor.embed_batch(batch_imgs)
-                    store.add(embs, batch_specs)
-                    total_chips += len(batch_specs)
-                    batch_specs, batch_imgs = [], []
-            if batch_imgs:
-                embs = extractor.embed_batch(batch_imgs)
-                store.add(embs, batch_specs)
-                total_chips += len(batch_specs)
+    print(f"Generated {len(all_specs)} chip specs across {len(image_paths)} sources.")
+
+    dataset = _ChipDataset(all_specs, extractor.input_size, extractor.transform)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(extractor.device == "cuda"),
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=False,
+    )
+
+    total_chips = 0
+    for tensor_batch, idx_batch in tqdm(loader, desc="Embedding", total=len(loader)):
+        embs = extractor.embed_tensor_batch(tensor_batch)
+        batch_specs = [all_specs[i] for i in idx_batch.tolist()]
+        store.add(embs, batch_specs)
+        total_chips += len(batch_specs)
 
     print(f"Indexed {total_chips} chips across {len(image_paths)} sources.")
     store.save(store_path)
